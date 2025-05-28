@@ -44,6 +44,10 @@ args = parser.parse_args()
 
 if args.command1 == "users":
     print(f"command1 = {args.command1}")
+    if args.command2 == "create":
+        print(f"command2 = {args.command2}")
+    elif args.command2 == "delete":
+        print(f"command2 = {args.command2}")
 elif args.command1 == "profiles":
     print(f"command1 = {args.command1}")
 else:
