@@ -1,5 +1,7 @@
 # HOWTO
 
+## Install Python
+
 How can I install Python in an isolated directory—for example, /data/python/—without affecting the existing environment?
 
 To install Python in a specific, isolated directory (like `/data/python/`) without touching the system's `/usr/bin` or `/usr/lib` directories, you cannot use `dnf`. 
@@ -128,4 +130,103 @@ export PATH="/data/python/bin:$PATH"
 ```
 
 ---
+
+## Kill Oracle PDB sessions
+
+kill all Oracle sessions linked to a specific PDB <=> kill all connections to a specific Oracle PDB
+
+### ⚠️ Prerequisite
+To kill sessions in a PDB, you must be connected to the **CDB$ROOT** (the container) as a user with `SYSDBA` privileges (usually `SYS`).
+
+### Method 1: The PL/SQL Block (The "Surgical" Way)
+Use this if you want to kill all active connections to a specific PDB **without** shutting down the PDB itself. This loops through all sessions associated with the PDB's `CON_ID` and disconnects them.
+
+**Replace `'YOUR_PDB_NAME'` with your actual PDB name (keep it in UPPERCASE).**
+
+```sql
+BEGIN
+    FOR rec IN (
+        SELECT s.sid, s.serial# 
+        FROM v$session s 
+        JOIN v$pdbs p ON s.con_id = p.con_id 
+        WHERE p.name = 'YOUR_PDB_NAME'
+    ) LOOP
+        EXECUTE IMMEDIATE 'ALTER SYSTEM DISCONNECT SESSION ''' || rec.sid || ',' || rec.serial# || ''' IMMEDIATE';
+    END LOOP;
+END;
+/
+```
+
+**Why `DISCONNECT SESSION ... IMMEDIATE` instead of `KILL SESSION`?**
+*   `KILL SESSION` marks the session as killed, but the process may wait for the user to acknowledge it or for a rollback to complete.
+*   `DISCONNECT SESSION ... IMMEDIATE` tells the OS to kill the process immediately, which is much more effective for automation.
+
+### Method 2: Closing the PDB (The "Hammer" Way)
+If your goal is to ensure **zero** connections so you can perform maintenance (like unplugging the PDB or changing settings), the fastest and cleanest way is to force the PDB closed.
+
+```sql
+ALTER PLUGGABLE DATABASE YOUR_PDB_NAME CLOSE IMMEDIATE;
+```
+*This automatically kills all sessions linked to that PDB instantly.*
+
+### Method 3: Ansible Implementation
+To do this via Ansible, you should use the `community.general.oracle_sql` module or run a shell command using `sqlplus`. 
+
+Below is the implementation using a shell command, as it is the most universal way to handle `sqlplus` interactions.
+
+```yaml
+---
+- name: Kill Oracle PDB Sessions
+  hosts: db_servers
+  become: yes
+  vars:
+    oracle_home: "/u01/app/oracle/product/19.0.0/dbhome_1"
+    oracle_user: "oracle"
+    pdb_name: "MY_APP_PDB" # Ensure this is UPPERCASE
+
+  tasks:
+    - name: Disconnect all sessions from {{ pdb_name }}
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID=CDB1  # Change to your CDB SID
+        {{ oracle_user }} sqlplus -s / as sysdba <<EOF
+        SET FEEDBACK OFF;
+        BEGIN
+            FOR rec IN (
+                SELECT s.sid, s.serial# 
+                FROM v$session s 
+                JOIN v$pdbs p ON s.con_id = p.con_id 
+                WHERE p.name = '{{ pdb_name }}'
+            ) LOOP
+                EXECUTE IMMEDIATE 'ALTER SYSTEM DISCONNECT SESSION ''' || rec.sid || ',' || rec.serial# || ''' IMMEDIATE';
+            END LOOP;
+        END;
+        /
+        EXIT;
+        EOF
+      become_user: "{{ oracle_user }}"
+
+    - name: Verify no sessions remain for {{ pdb_name }}
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID=CDB1
+        {{ oracle_user }} sqlplus -s / as sysdba <<EOF
+        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF;
+        SELECT count(*) FROM v\$session s JOIN v\$pdbs p ON s.con_id = p.con_id WHERE p.name = '{{ pdb_name }}';
+        EXIT;
+        EOF
+      become_user: "{{ oracle_user }}"
+      register: session_count
+
+    - name: Report session count
+      debug:
+        msg: "Remaining sessions for {{ pdb_name }}: {{ session_count.stdout }}"
+```
+
+### Summary of Logic used:
+1.  **`v$session`**: Contains the current active sessions.
+2.  **`v$pdbs`**: Maps the PDB name (which is human-readable) to a `CON_ID` (Container ID).
+3.  **`JOIN`**: We join these two views on `con_id` to find only the sessions that belong to the specified PDB.
+4.  **`EXECUTE IMMEDIATE`**: Since `ALTER SYSTEM` is a DDL command, it cannot be run directly inside a PL/SQL loop; it must be executed as a dynamic string.
+5.  **`IMMEDIATE`**: Ensures the session is terminated regardless of the current state of the transaction.
 
